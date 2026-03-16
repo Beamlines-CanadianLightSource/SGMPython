@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, MaxAbsScaler
 
 class MapScan:
     """
@@ -484,28 +484,48 @@ class StackScan:
             return None
 
         # --- Data Validation & Preprocessing ---
-        # 1. Cast to float64 and handle NaNs/Infs
+        # 1. Cast to float64 and replace all non-finite values (NaN, Inf) with 0.0
         data = np.nan_to_num(pixel_spectra_concatenated.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
 
-        # 2. Remove constant columns (zero variance) which cause issues in PCA/scaling
+        # 2. Aggressive clipping to prevent overflows in variance calculations
+        # No physical SGM data should reasonably exceed 1e9 counts per pixel/channel
+        data = np.clip(data, 0, 1e9)
+
+        # 3. Remove constant or near-constant columns (very low variance)
+        # We use a more conservative threshold (1e-6) to avoid division by tiny numbers
         variances = np.var(data, axis=0)
-        non_constant_cols = variances > 0
+        non_constant_cols = variances > 1e-6 
+        
         if not np.any(non_constant_cols):
             print("Error: All data columns are constant. Cannot perform PCA.", file=sys.stderr)
             return None
         
         data = data[:, non_constant_cols]
 
-        # 3. Normalize (StandardScaler)
+        # 4. Normalize
+        # MinMaxScaler maps everything strictly to [0, 1], which is mathematically 'safe'
+        data = MinMaxScaler().fit_transform(data)
+
         if normalize:
-            scaler = StandardScaler()
-            processed_data = scaler.fit_transform(data)
+            # Center and scale. StandardScaler handles zero-variance columns 
+            # gracefully, but our 1e-6 filter above makes it even safer.
+            processed_data = StandardScaler().fit_transform(data)
+            # Clip the output of StandardScaler to a reasonable range (e.g., +/- 100 sigma)
+            # to prevent any stray huge values from causing overflows in matrix multiplication.
+            processed_data = np.clip(processed_data, -100, 100)
         else:
-            # Mean center at minimum
             processed_data = data - np.mean(data, axis=0)
+        
+        # Final safety check: force any remaining NaNs/Infs to zero before PCA/K-Means
+        processed_data = np.nan_to_num(processed_data, nan=0.0, posinf=0.0, neginf=0.0)
 
         # --- PCA ---
-        n_comp = min(n_components, processed_data.shape[1])
+        # Ensure n_components is not larger than number of samples or features
+        n_comp = min(n_components, processed_data.shape[0], processed_data.shape[1])
+        if n_comp < 1:
+            print("Error: Not enough data for PCA.", file=sys.stderr)
+            return None
+            
         pca = PCA(n_components=n_comp)
         pca_result = pca.fit_transform(processed_data)
 
@@ -696,23 +716,27 @@ class StackScan:
             print(f"Error reading SDD data for {detector_name} at {energy} eV: {e}", file=sys.stderr)
             return None
 
-    def plot_summary(self, channel_roi, map_roi=None, roll_shift=0, as_scatter_plot: bool = False, contrast=None, mcc_channels=None, sdd_detectors_to_plot=None, xeol_roi=None, dump_csv=None):
-        if not self.sdd_files:
-            print("Error: No SDD files found.", file=sys.stderr)
-            return
+    def get_data(self, channel_roi, map_roi=None, mcc_channels=None, sdd_detectors=None, xeol_roi=None, roll_shift=0):
+        """
+        Calculates energy-dependent summary data (intensities in ROIs) for the stack.
 
+        Returns:
+            dict: A dictionary containing energies and the calculated intensity arrays.
+        """
         all_energies = np.array(sorted(self.energies))
         all_detector_names = sorted(self.sdd_files.keys())
         
-        detector_names = [d for d in sdd_detectors_to_plot if d in all_detector_names] if sdd_detectors_to_plot else all_detector_names
-        if not detector_names:
-            print(f"Warning: None of the specified detectors found.", file=sys.stderr)
-            return
+        detector_names = [d for d in sdd_detectors if d in all_detector_names] if sdd_detectors else all_detector_names
         
-        summary_data = {det: [] for det in detector_names}
-        mcc_summary_data = {ch: [] for ch in mcc_channels} if mcc_channels else {}
-        xeol_summary_data = []
-        summary_energies = []
+        results = {
+            'energies': all_energies,
+            'sdd': {det: [] for det in detector_names},
+            'mcc': {ch: [] for ch in mcc_channels} if mcc_channels else {},
+            'i0': [],
+            'tey': [],
+            'xeol_total': [],
+            'xeol_roi': []
+        }
 
         if self.x.size > 0 and self.y.size > 0:
             x_min, x_max = self.x.min(), self.x.max()
@@ -732,78 +756,136 @@ class StackScan:
         spatial_mask = (self.x >= x1_map) & (self.x <= x2_map) & (self.y >= y1_map) & (self.y <= y2_map)
 
         for energy in all_energies:
-            intensity_found = False
             for det_name in detector_names:
                 spectra_2d = self.get_sdd_data(det_name, energy)
                 if spectra_2d is not None:
-                    selected_spectra = spectra_2d[spatial_mask]
-                    roi_intensity = np.sum(selected_spectra[:, channel_roi[0]:channel_roi[1]])
-                    summary_data[det_name].append(roi_intensity)
-                    intensity_found = True
+                    if roll_shift != 0:
+                        spectra_2d = np.roll(spectra_2d, shift=roll_shift, axis=0)
+                    roi_intensity = np.sum(spectra_2d[spatial_mask, channel_roi[0]:channel_roi[1]])
+                    results['sdd'][det_name].append(roi_intensity)
                 else:
-                    summary_data[det_name].append(np.nan)
+                    results['sdd'][det_name].append(np.nan)
             
-            if mcc_channels and self.mcc_data.get(energy) is not None:
-                for mcc_channel in mcc_channels:
+            if self.mcc_data.get(energy) is not None:
+                mcc_en_data = self.mcc_data[energy]
+                if roll_shift != 0:
+                    mcc_en_data = np.roll(mcc_en_data, shift=roll_shift, axis=0)
+
+                def get_mcc_val(ch_name):
                     try:
-                        channel_index = self.mcc_channel_names.index(f'ch{mcc_channel}')
-                        mcc_summary_data[mcc_channel].append(np.mean(self.mcc_data[energy][spatial_mask, channel_index]))
+                        idx = self.mcc_channel_names.index(ch_name)
+                        return np.mean(mcc_en_data[spatial_mask, idx])
                     except (ValueError, IndexError):
-                        mcc_summary_data[mcc_channel].append(np.nan)
+                        return np.nan
 
-            if xeol_roi and self.xeol_data.get(energy) is not None:
-                xeol_summary_data.append(np.sum(self.xeol_data[energy][xeol_roi[0]:xeol_roi[1]]))
+                results['i0'].append(get_mcc_val('ch1'))
+                results['tey'].append(get_mcc_val('ch2'))
+                if mcc_channels:
+                    for ch in mcc_channels:
+                        results['mcc'][ch].append(get_mcc_val(f'ch{ch}'))
+            else:
+                results['i0'].append(np.nan)
+                results['tey'].append(np.nan)
+                if mcc_channels:
+                    for ch in mcc_channels:
+                        results['mcc'][ch].append(np.nan)
 
-            if intensity_found:
-                summary_energies.append(energy)
+            if self.xeol_data.get(energy) is not None:
+                xeol_spec = self.xeol_data[energy]
+                results['xeol_total'].append(np.sum(xeol_spec))
+                if xeol_roi:
+                    results['xeol_roi'].append(np.sum(xeol_spec[xeol_roi[0]:xeol_roi[1]]))
+            else:
+                results['xeol_total'].append(np.nan)
+                if xeol_roi:
+                    results['xeol_roi'].append(np.nan)
+
+        return results
+
+    def export_csv(self, filename, channel_roi, map_roi=None, mcc_channels=None, sdd_detectors=None, xeol_roi=None, roll_shift=0):
+        """
+        Exports energy-dependent summary data to a CSV file.
+        """
+        data = self.get_data(channel_roi, map_roi, mcc_channels, sdd_detectors, xeol_roi, roll_shift)
         
-        if dump_csv:
-            header = ["Energy"] + detector_names
-            data_columns = [summary_energies] + [summary_data[d] for d in detector_names]
-            
-            fmt_list = ['%.4f']  # Format for energy
-            fmt_list.extend(['%d'] * len(detector_names))  # Format for SDD data
-            
-            if xeol_roi and xeol_summary_data:
-                header.append("XEOL_ROI")
-                data_columns.append(xeol_summary_data)
-                fmt_list.append('%d') # Format for XEOL data
-            
-            output_data = np.array(data_columns).T
-            np.savetxt(dump_csv, output_data, delimiter=',', header=','.join(header), comments='', fmt=fmt_list)
+        header = ["Energy"]
+        data_columns = [data['energies']]
+        fmt_list = ['%.4f']
+
+        for det in data['sdd']:
+            header.append(det)
+            data_columns.append(data['sdd'][det])
+            fmt_list.append('%d')
+
+        if any(~np.isnan(data['i0'])):
+            header.append("I0")
+            data_columns.append(data['i0'])
+            fmt_list.append('%.6e')
+
+        if any(~np.isnan(data['tey'])):
+            header.append("TEY")
+            data_columns.append(data['tey'])
+            fmt_list.append('%.6e')
+
+        if mcc_channels:
+            for ch in mcc_channels:
+                if ch in data['mcc'] and any(~np.isnan(data['mcc'][ch])):
+                    header.append(f"MCC_ch{ch}")
+                    data_columns.append(data['mcc'][ch])
+                    fmt_list.append('%.6e')
+
+        if any(~np.isnan(data['xeol_total'])):
+            header.append("XEOL_Total")
+            data_columns.append(data['xeol_total'])
+            fmt_list.append('%d')
+
+        if xeol_roi and any(~np.isnan(data['xeol_roi'])):
+            header.append(f"XEOL_ROI_{xeol_roi[0]}_{xeol_roi[1]}")
+            data_columns.append(data['xeol_roi'])
+            fmt_list.append('%d')
+
+        output_data = np.array(data_columns).T
+        np.savetxt(filename, output_data, delimiter=',', header=','.join(header), comments='', fmt=fmt_list)
+        print(f"Summary data exported to {filename}")
+
+    def plot_summary(self, channel_roi, map_roi=None, roll_shift=0, as_scatter_plot: bool = False, contrast=None, mcc_channels=None, sdd_detectors_to_plot=None, xeol_roi=None):
+        if not self.sdd_files:
+            print("Error: No SDD files found.", file=sys.stderr)
+            return
+
+        if self.x.size == 0 or self.y.size == 0:
+            print("Error: Coordinate data not found.", file=sys.stderr)
+            return
+
+        if map_roi is None:
+            map_roi = [self.x.min(), self.x.max(), self.y.min(), self.y.max()]
+        
+        summary = self.get_data(channel_roi, map_roi, mcc_channels, sdd_detectors_to_plot, xeol_roi, roll_shift)
+        summary_energies = summary['energies']
+        detector_names = list(summary['sdd'].keys())
+        
+        x1_map, x2_map = sorted(map_roi[0:2])
+        y1_map, y2_map = sorted(map_roi[2:4])
+        spatial_mask = (self.x >= x1_map) & (self.x <= x2_map) & (self.y >= y1_map) & (self.y <= y2_map)
 
         # --- Determine Threshold Energy ---
-        if len(summary_energies) > 5:
-            # Use the first detector with valid data to find the absorption edge
-            primary_detector_data = np.array(summary_data[detector_names[0]])
-            valid_indices = ~np.isnan(primary_detector_data)
-            energies = np.array(summary_energies)[valid_indices]
-            spectrum = primary_detector_data[valid_indices]
-
-            if len(energies) > 5:
-                # Smooth the spectrum with a moving average of 3 points
-                smoothed_spectrum = np.convolve(spectrum, np.ones(3)/3, mode='valid')
-                smoothed_energies = energies[1:-1] # Adjust energies for smoothed data
-
-                if len(smoothed_energies) > 1:
-                    # Calculate the first derivative to find the point of max intensity rise
-                    derivative = np.gradient(smoothed_spectrum, smoothed_energies)
-                    
-                    # The index of the max derivative corresponds to the absorption edge
-                    max_derivative_index = np.argmax(derivative)
-                    threshold_energy = smoothed_energies[max_derivative_index]
-                else:
-                    # Fallback for very short scans or scans with lots of NaNs
-                    threshold_energy = all_energies[len(all_energies) // 2]
-            else:
-                # Fallback for very short scans or scans with lots of NaNs
-                threshold_energy = all_energies[len(all_energies) // 2]
-        else:
-            # Fallback for very short scans
-            threshold_energy = all_energies[len(all_energies) // 2]
+        # Find first detector with valid data
+        threshold_energy = summary_energies[len(summary_energies)//2] # Default
+        for det_name in detector_names:
+            spec = np.array(summary['sdd'][det_name])
+            valid_indices = ~np.isnan(spec)
+            if np.sum(valid_indices) > 5:
+                en_valid = summary_energies[valid_indices]
+                spec_valid = spec[valid_indices]
+                smoothed_spec = np.convolve(spec_valid, np.ones(3)/3, mode='valid')
+                smoothed_en = en_valid[1:-1]
+                if len(smoothed_en) > 1:
+                    derivative = np.gradient(smoothed_spec, smoothed_en)
+                    threshold_energy = smoothed_en[np.argmax(derivative)]
+                    break
 
         averaged_maps = {det: {'before': {'sum': None, 'count': 0}, 'after': {'sum': None, 'count': 0}} for det in detector_names}
-        for energy in all_energies:
+        for energy in summary_energies:
             period = 'before' if energy < threshold_energy else 'after'
             for det_name in detector_names:
                 spectra_2d = self.get_sdd_data(det_name, energy)
@@ -858,8 +940,8 @@ class StackScan:
                 rect = plt.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1.5, edgecolor='r', facecolor='none', linestyle='--')
                 ax.add_patch(rect)
 
-            representative_energy = min(summary_energies, key=lambda x: abs(x - threshold_energy)) if summary_energies else None
-            if representative_energy:
+            representative_energy = summary_energies[np.argmin(np.abs(summary_energies - threshold_energy))] if summary_energies.size > 0 else None
+            if representative_energy is not None:
                 spectra_2d = self.get_sdd_data(det_name, representative_energy)
                 if spectra_2d is not None:
                     spectrum_from_roi = np.sum(spectra_2d[spatial_mask], axis=0)
@@ -869,11 +951,11 @@ class StackScan:
                     ax_spec.grid(True)
 
         summary_plot_index = num_detectors
-        if summary_energies:
+        if summary_energies.size > 0:
             ax_summary = fig.add_subplot(gs[summary_plot_index, :])
             summary_plot_index += 1
             for det_name in detector_names:
-                ax_summary.plot(summary_energies, summary_data[det_name], 'o-', label=det_name)
+                ax_summary.plot(summary_energies, summary['sdd'][det_name], 'o-', label=det_name)
             ax_summary.axvline(x=threshold_energy, color='purple', linestyle='--', label=f'Threshold: {threshold_energy:.2f} eV')
             ax_summary.set_title("Energy Dependence of Intensity in Map ROI")
             ax_summary.set_xlabel("Energy (eV)"); ax_summary.set_ylabel("Total Intensity in ROIs")
@@ -883,7 +965,14 @@ class StackScan:
             ax_mcc_summary = fig.add_subplot(gs[summary_plot_index, :])
             summary_plot_index += 1
             for mcc_channel in mcc_channels:
-                ax_mcc_summary.plot(summary_energies, mcc_summary_data[mcc_channel], 'o-', label=f'MCC ch{mcc_channel}')
+                if mcc_channel in summary['mcc']:
+                    ax_mcc_summary.plot(summary_energies, summary['mcc'][mcc_channel], 'o-', label=f'MCC ch{mcc_channel}')
+            
+            if any(~np.isnan(summary['i0'])):
+                ax_mcc_summary.plot(summary_energies, summary['i0'], 's--', label='I0 (ch1)', alpha=0.7)
+            if any(~np.isnan(summary['tey'])):
+                ax_mcc_summary.plot(summary_energies, summary['tey'], 'd--', label='TEY (ch2)', alpha=0.7)
+
             ax_mcc_summary.axvline(x=threshold_energy, color='purple', linestyle='--')
             ax_mcc_summary.set_title("MCC Channel Dependence on Energy in Map ROI")
             ax_mcc_summary.set_xlabel("Energy (eV)"); ax_mcc_summary.set_ylabel("Mean Value in ROI")
@@ -891,7 +980,7 @@ class StackScan:
 
         if self.xeol_data:
             xeol_energies = sorted(self.xeol_data.keys())
-            if xeol_energies:
+            if len(xeol_energies) > 0:
                 # --- Calculate summed and averaged XEOL spectra ---
                 first_spec_shape = self.xeol_data[xeol_energies[0]].shape
                 sum_below, sum_above = np.zeros(first_spec_shape), np.zeros(first_spec_shape)
@@ -933,9 +1022,9 @@ class StackScan:
                 ax_xeol_vs_energy.set_title("XEOL Spectrum vs. Excitation Energy")
                 ax_xeol_vs_energy.set_xlabel("Energy (eV)")
 
-        if xeol_roi and xeol_summary_data:
+        if xeol_roi and any(~np.isnan(summary['xeol_roi'])):
             ax_xeol_summary = fig.add_subplot(gs[summary_plot_index, :])
-            ax_xeol_summary.plot(summary_energies, xeol_summary_data, 'o-')
+            ax_xeol_summary.plot(summary_energies, summary['xeol_roi'], 'o-')
             ax_xeol_summary.set_title(f"XEOL Intensity vs. Energy (ROI: {xeol_roi[0]}-{xeol_roi[1]})")
             ax_xeol_summary.set_xlabel("Energy (eV)")
             ax_xeol_summary.set_ylabel("Total XEOL Intensity in ROI")
