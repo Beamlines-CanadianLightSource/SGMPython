@@ -1012,15 +1012,26 @@ class StackScan:
                 ax_summed_xeol.legend()
                 ax_summed_xeol.grid(True)
 
-                # --- Plot XEOL vs Energy (right) ---
+                # --- Plot XEOL vs Energy Heatmap (right) ---
                 xeol_stack = np.array([self.xeol_data[en] for en in xeol_energies])
-                im = ax_xeol_vs_energy.imshow(xeol_stack.T, aspect='auto', extent=[min(xeol_energies), max(xeol_energies), 0, xeol_stack.shape[1]], origin='lower', cmap='viridis')
+                # We transpose so X = Excitation Energy, Y = Emission Bin
+                im = ax_xeol_vs_energy.imshow(
+                    xeol_stack.T, 
+                    aspect='auto', 
+                    extent=[min(xeol_energies), max(xeol_energies), 0, xeol_stack.shape[1]], 
+                    origin='lower', 
+                    cmap='magma',
+                    interpolation='nearest'
+                )
+                
                 if xeol_roi:
-                    ax_xeol_vs_energy.axhline(y=xeol_roi[0], color='r', linestyle=':')
-                    ax_xeol_vs_energy.axhline(y=xeol_roi[1], color='r', linestyle=':')
-                fig.colorbar(im, ax=ax_xeol_vs_energy, label="Intensity")
-                ax_xeol_vs_energy.set_title("XEOL Spectrum vs. Excitation Energy")
-                ax_xeol_vs_energy.set_xlabel("Energy (eV)")
+                    ax_xeol_vs_energy.axhline(y=xeol_roi[0], color='cyan', linestyle='--', linewidth=1, label='XEOL ROI')
+                    ax_xeol_vs_energy.axhline(y=xeol_roi[1], color='cyan', linestyle='--', linewidth=1)
+                
+                fig.colorbar(im, ax=ax_xeol_vs_energy, label="Intensity (counts)")
+                ax_xeol_vs_energy.set_title("XEOL Emission Heatmap vs. Excitation Energy")
+                ax_xeol_vs_energy.set_xlabel("Excitation Energy (eV)")
+                ax_xeol_vs_energy.set_ylabel("XEOL Emission Bin")
 
         if xeol_roi and any(~np.isnan(summary['xeol_roi'])):
             ax_xeol_summary = fig.add_subplot(gs[summary_plot_index, :])
