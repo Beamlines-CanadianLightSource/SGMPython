@@ -1045,6 +1045,74 @@ class StackScan:
         fig.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.show()
 
+    def plot_sdd_heatmap(self, detector_name, map_roi=None, cmap='magma', log_scale=False, vmin=None, vmax=None):
+        """
+        Plots a heatmap of the SDD XRF spectra as a function of incident energy.
+        
+        Args:
+            detector_name (str): The name of the detector (e.g., 'sdd1').
+            map_roi (list, optional): [x_min, x_max, y_min, y_max] to restrict the spatial area.
+            cmap (str): The colormap to use for the heatmap.
+            log_scale (bool): Whether to plot the intensity on a log10 scale.
+            vmin (float, optional): The minimum value for the color scale.
+            vmax (float, optional): The maximum value for the color scale.
+        """
+        if detector_name not in self.sdd_files:
+            print(f"Error: Detector {detector_name} not found.", file=sys.stderr)
+            return
+
+        energies = sorted(self.energies)
+        if not energies:
+            print("Error: No energy data found.", file=sys.stderr)
+            return
+
+        # Handle map_roi
+        if map_roi is not None:
+            x1, x2 = sorted(map_roi[0:2])
+            y1, y2 = sorted(map_roi[2:4])
+            spatial_mask = (self.x >= x1) & (self.x <= x2) & (self.y >= y1) & (self.y <= y2)
+        else:
+            spatial_mask = np.ones(self.x.shape, dtype=bool)
+
+        heatmap_data = []
+        valid_energies = []
+        
+        for en in energies:
+            spectra_2d = self.get_sdd_data(detector_name, en)
+            if spectra_2d is not None:
+                current_mask = spatial_mask[:spectra_2d.shape[0]]
+                if np.any(current_mask):
+                    heatmap_data.append(np.sum(spectra_2d[current_mask], axis=0))
+                    valid_energies.append(en)
+        
+        if not heatmap_data:
+            print(f"Error: No SDD data found for {detector_name} within the specified ROI.", file=sys.stderr)
+            return
+            
+        heatmap_data = np.array(heatmap_data) # (Energies, Channels)
+        plot_data = heatmap_data.T.astype(np.float64)
+        
+        if log_scale:
+            # Use log10(intensity + 1) to handle zero counts gracefully
+            plot_data = np.log10(plot_data + 1)
+        
+        plt.figure(figsize=(10, 6))
+        im = plt.imshow(
+            plot_data, 
+            aspect='auto', 
+            extent=[min(valid_energies), max(valid_energies), 0, heatmap_data.shape[1]], 
+            origin='lower', 
+            cmap=cmap,
+            interpolation='nearest',
+            vmin=vmin,
+            vmax=vmax
+        )
+        plt.colorbar(im, label="Log10(Intensity + 1)" if log_scale else "Intensity (counts)")
+        plt.title(f"SDD {detector_name} XRF Heatmap vs. Incident Energy")
+        plt.xlabel("Incident Energy (eV)")
+        plt.ylabel("SDD Channel")
+        plt.show()
+
 
 
 
