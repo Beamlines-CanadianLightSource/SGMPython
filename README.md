@@ -1,132 +1,109 @@
-# SGMAnalysis
+# SGM Analysis
 
-A Python package for analyzing and visualizing data from the SGM beamline. It provides tools for both single-energy **Map Scans** and multi-energy **Stack Scans**, with advanced features for XEOL (X-ray Excited Optical Luminescence) and chemometric analysis (PCA/K-Means).
+A Python library for analyzing and visualizing data from the SGM (Spherical Grating Monochromator) beamline. This package provides tools for processing map scans, stack scans, and performing advanced data analysis like PCA and K-Means clustering.
+
+## Features
+
+- **Map Scan Analysis**: Process individual map scans (`MapScan`) with support for SDD, MCC, and XEOL data.
+- **Stack Scan Analysis**: Analyze series of maps at different energies (`StackScan`).
+- **Heatmap Visualization**: Generate detailed heatmaps of SDD XRF spectra vs. incident energy.
+- **Advanced Analysis**: Integrated PCA (Principal Component Analysis) and K-Means clustering for spectral data.
+- **Interactive Dashboards**: Interactive Plotly-based widgets for Jupyter Notebooks to explore maps and spectra in real-time.
+- **XEOL Support**: Dedicated plotting for X-ray Excited Optical Luminescence spectra.
+- **Data Export**: Export processed results to CSV for further analysis.
 
 ## Installation
 
 ```bash
-pip install .
+# Clone the repository
+git clone <repository-url>
+cd sgmanalysis
 ```
 
-## Features
+Ensure you have the following dependencies installed:
+- `numpy`, `h5py`, `matplotlib`, `scikit-learn`, `plotly`, `ipywidgets`
 
-- **Efficient Data Handling**: Lazy loading of high-volume SDD, MCC, and XEOL binary files.
-- **Integrated Metadata**: Automatically parses HDF5 scan metadata and coordinates.
-- **Interactive Dashboards**: Jupyter-ready Plotly widgets for real-time ROI selection and linked spatial-spectral analysis.
-- **Advanced Analysis**: PCA and K-Means clustering to identify chemically distinct phases.
-- **Robust Preprocessing**: Built-in handling for detector glitches, dead time, and "jagged" snake scans (roll correction).
-- **Comprehensive Exports**: Single-method CSV exports including I0, TEY, and integrated XEOL intensities.
+## Usage
 
----
-
-## 1. Map Scans (Single Energy)
-
-A `MapScan` is used for analyzing a single spatial map recorded at a fixed energy.
+### 1. Map Scan Analysis
 
 ```python
 from sgmanalysis import MapScan
 
-# Load the scan
-scan = MapScan('path/to/my_map_scan.h5')
+# Load a map scan
+scan = MapScan("path/to/your/scan.h5")
 
-# Generate a quick overview of all detectors
-# channel_roi: [start_bin, end_bin] of the SDD spectrum
-scan.plot_overview(channel_roi=(80, 101), roll_shift=-6)
-
-# Access raw data
-sdd1_data = scan.get_sdd_data('sdd1')  # 2D array: (pixels, bins)
-xeol_data = scan.xeol_data             # 1D array: XEOL spectrum
+# Plot an overview of the map
+# channel_roi=(start_bin, end_bin)
+scan.plot_overview(channel_roi=(80, 101))
 ```
 
----
-
-## 2. Stack Scans (Energy Series)
-
-A `StackScan` manages a series of maps taken at different excitation energies (e.g., an XANES stack).
+### 2. Stack Scan Analysis
 
 ```python
 from sgmanalysis import StackScan
 
-# Load the stack
-stack = StackScan('path/to/my_stack_scan.h5')
+# Load a stack scan
+stack = StackScan("path/to/your/stack.h5")
 
-# Plot summary with pre-edge/post-edge comparison
-stack.plot_summary(
-    channel_roi=(20, 40), 
-    map_roi=[-1.5, 1.5, -0.5, 0.5], # Spatial ROI [x1, x2, y1, y2]
-    roll_shift=-6,
-    xeol_roi=(100, 200)             # ROI for XEOL energy dependence
-)
+# Plot a summary of the stack
+stack.plot_summary(channel_roi=(80, 101))
 
-# Export summary data to CSV
-# Automatically includes I0 (ch1), TEY (ch2), and XEOL total intensity
-stack.export_csv(
-    "summary_data.csv",
-    channel_roi=(20, 40),
-    mcc_channels=[3, 4],            # Optional: include extra MCC channels
-    xeol_roi=(100, 200)
-)
+# Generate an SDD Heatmap (XRF spectra vs. Energy)
+stack.plot_sdd_heatmap(detector_name='sdd1')
 ```
 
----
-
-## 3. XEOL (Optical Luminescence)
-
-The package provides specialized tools for XEOL analysis.
+### 3. PCA and K-Means Clustering
 
 ```python
-from sgmanalysis import plot_xeol
-
-# Quick plot of a XEOL spectrum from an H5 scan or a .bin file
-plot_xeol('path/to/scan.h5')
-
-# Access XEOL data for a specific energy in a stack
-# XEOL data is stored in a dictionary: {energy: 1D_spectrum_array}
-available_energies = list(stack.xeol_data.keys())
-spectrum = stack.xeol_data[available_energies[0]]
-```
-
----
-
-## 4. PCA & K-Means Clustering
-
-Identify different chemical phases by clustering pixel spectra across all energies in a stack.
-
-```python
-# 1. Perform the analysis
-# Combine data from all 4 detectors for maximum sensitivity
+# Perform PCA and K-Means analysis on a StackScan
 results = stack.analyze_pca_kmeans(
-    detector_names=['sdd1', 'sdd2', 'sdd3', 'sdd4'], 
-    channel_roi=(20, 40), 
-    n_clusters=3
+    detector_names=['sdd1', 'sdd2'], 
+    channel_roi=(80, 101), 
+    n_clusters=4
 )
 
-# 2. Visualize and save
-# Saves spatial data to 'phase_analysis.csv' and 
-# cluster spectra to 'phase_analysis_spectra.csv'
-stack.plot_pca_kmeans(results, roll_shift=-6, outfile="phase_analysis")
+# Visualize the clustering results
+stack.plot_pca_kmeans(results)
 ```
 
----
-
-## 5. Interactive Dashboards (Jupyter)
-
-The package includes interactive dashboards built with `Plotly FigureWidgets`. These allow you to select regions on a map to see the corresponding summed spectra or PFY (Partial Fluorescence Yield).
+### 4. Interactive Analysis (Jupyter Notebook)
 
 ```python
 from sgmanalysis import interactive_map_analysis, interactive_stack_analysis
 
-# Interactive dashboard for a single map
+# Interactive analysis for a single map
 interactive_map_analysis(scan, detector_name='sdd1')
 
-# Interactive dashboard for a stack (multi-detector)
-# Syncs selection across all maps and PFY plots
-interactive_stack_analysis(stack, detector_names=['sdd1', 'sdd2'])
+# Interactive analysis for a stack scan
+interactive_stack_analysis(stack)
 ```
 
-## Dependencies
+## Heatmap Functionality
 
-- **Data**: `h5py`, `numpy`
-- **Visualization**: `matplotlib`, `plotly`
-- **Analysis**: `scikit-learn`
-- **UI**: `ipywidgets`, `anywidget`
+The `StackScan.plot_sdd_heatmap` method is specifically designed to visualize how the SDD XRF spectra evolve with incident energy. This is useful for identifying resonance peaks and understanding the electronic structure of your sample.
+
+```python
+stack.plot_sdd_heatmap(
+    detector_name='sdd1', 
+    log_scale=True, 
+    cmap='magma'
+)
+```
+
+## XEOL Visualization
+
+Use the standalone `plot_xeol` function or the built-in scan methods to visualize XEOL spectra.
+
+```python
+from sgmanalysis import plot_xeol
+
+plot_xeol("path/to/your/xeol_data.bin")
+```
+
+## Project Structure
+
+- `scans.py`: Core classes `MapScan` and `StackScan`.
+- `interactive.py`: Plotly/ipywidgets interactive analysis tools.
+- `plotting.py`: General plotting utilities.
+- `__init__.py`: Package entry point.
